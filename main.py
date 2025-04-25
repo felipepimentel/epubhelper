@@ -162,6 +162,61 @@ def is_valid_epub(epub_path):
         return False, f"Error checking EPUB: {str(e)}"
 
 
+def try_repair_epub(epub_path):
+    """
+    Attempt to repair a corrupted EPUB file.
+
+    Args:
+        epub_path (str): Path to the EPUB file
+
+    Returns:
+        bool: True if repair was successful, False otherwise
+    """
+    try:
+        # Create a backup
+        backup_path = f"{epub_path}.backup"
+        shutil.copy2(epub_path, backup_path)
+
+        # Try to repair using ebook-convert itself
+        temp_path = f"{epub_path}.temp"
+        cmd = [
+            "ebook-convert",
+            epub_path,
+            temp_path,
+            "--no-default-epub-cover",
+            "--no-svg-cover",
+            "--enable-heuristics",
+            "--fix-trailing-nbsp",
+            "--subset-embedded-fonts",
+            "--expand-css",
+            "--epub-flatten",
+        ]
+
+        env = os.environ.copy()
+        env["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
+        env["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu"
+        env["QT_QPA_PLATFORM"] = "offscreen"
+
+        process = subprocess.run(cmd, capture_output=True, text=True, env=env)
+
+        if os.path.exists(temp_path):
+            # Replace original with repaired version
+            shutil.move(temp_path, epub_path)
+            os.remove(backup_path)
+            return True
+
+        # Restore backup if repair failed
+        shutil.move(backup_path, epub_path)
+        return False
+
+    except Exception as e:
+        logging.error(f"Error trying to repair {epub_path}: {e}")
+        # Restore backup if exists
+        if os.path.exists(backup_path):
+            shutil.move(backup_path, epub_path)
+        return False
+
+
 def convert_epub_to_pdf(
     epub_file,
     output_dir=None,
@@ -196,11 +251,19 @@ def convert_epub_to_pdf(
     is_valid, error_msg = is_valid_epub(epub_file)
     if not is_valid:
         logging.error(f"Invalid EPUB file: {epub_file} - {error_msg}")
-        if report:
-            report.add_corrupted(epub_file, error_msg)
-        if quarantine_dir:
-            move_to_quarantine(epub_file, quarantine_dir)
-        return False
+
+        # Try to repair the EPUB
+        logging.info(f"Attempting to repair: {epub_file}")
+        if try_repair_epub(epub_file):
+            logging.info(f"Successfully repaired: {epub_file}")
+            is_valid, error_msg = is_valid_epub(epub_file)
+
+        if not is_valid:
+            if report:
+                report.add_corrupted(epub_file, error_msg)
+            if quarantine_dir:
+                move_to_quarantine(epub_file, quarantine_dir)
+            return False
 
     # Define output directory (same as EPUB if not specified)
     if output_dir is None:
@@ -231,7 +294,25 @@ def convert_epub_to_pdf(
     for attempt in range(max_retries):
         try:
             # Build ebook-convert command with additional options
-            cmd = ["ebook-convert", epub_file, pdf_file]
+            cmd = [
+                "ebook-convert",
+                epub_file,
+                pdf_file,
+                "--pdf-add-toc",
+                "--pretty-print",
+                "--enable-heuristics",
+                "--asciiize",
+                "--embed-font-family",
+                "Liberation Serif",
+                "--subset-embedded-fonts",
+                "--filter-css",
+                "font-family,color,margin-left,margin-right",
+                "--expand-css",
+                "--chapter-mark",
+                "pagebreak",
+                "--page-breaks-before",
+                "/",
+            ]
 
             # Add PDF options if provided
             if pdf_options:
@@ -266,7 +347,7 @@ def convert_epub_to_pdf(
             logging.error(f"Error: {e.stderr}")
 
             if attempt < max_retries - 1:
-                time.sleep(1)  # Wait before retrying
+                time.sleep(2)  # Increased wait time between retries
             else:
                 if report:
                     report.add_failed(epub_file, last_error)
